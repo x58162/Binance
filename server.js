@@ -38,6 +38,7 @@ let restState = "尚未讀取";
 let streamState = "尚未連線";
 let lastError = null;
 const positions = new Map();
+const marketTickers = new Map();
 
 function overallState() {
   return "REST " + restState + "｜帳戶串流" + streamState + "｜行情" + marketState;
@@ -112,7 +113,7 @@ function syncMarketStream() {
 }
 
 function connectMarketStream(symbols, generation) {
-  const streams = symbols.map(symbol => symbol + "@markPrice@1s").join("/");
+  const streams = symbols.flatMap(symbol => [symbol + "@markPrice@1s", symbol + "@ticker"]).join("/");
   const url = "wss://fstream.binance.com/stream?streams=" + streams;
   marketState = "連線中";
   publishStatus();
@@ -129,7 +130,24 @@ function connectMarketStream(symbols, generation) {
     let message;
     try { message = JSON.parse(raw.toString()); } catch { return; }
     const event = message.data || message;
-    if (event.e !== "markPriceUpdate" || !event.s || event.p === undefined) return;
+    if (!event.s) return;
+    if (event.e === "24hrTicker") {
+      const ticker = {
+        symbol: event.s,
+        lastPrice: String(event.c ?? "0"),
+        priceChange: String(event.p ?? "0"),
+        priceChangePercent: String(event.P ?? "0"),
+        highPrice: String(event.h ?? "0"),
+        lowPrice: String(event.l ?? "0"),
+        volume: String(event.v ?? "0"),
+        quoteVolume: String(event.q ?? "0"),
+        eventTime: event.E || Date.now()
+      };
+      marketTickers.set(event.s, ticker);
+      sendToBrowsers("ticker", ticker);
+      return;
+    }
+    if (event.e !== "markPriceUpdate" || event.p === undefined) return;
     const mark = Number(event.p);
     if (!Number.isFinite(mark)) return;
     markPriceEventCount += 1;
@@ -480,6 +498,9 @@ browserWss.on("connection", client => {
     serverTime: Date.now()
   }));
   client.send(JSON.stringify({ type: "positions", payload: publicPositions(), serverTime: Date.now() }));
+  for (const ticker of marketTickers.values()) {
+    client.send(JSON.stringify({ type: "ticker", payload: ticker, serverTime: Date.now() }));
+  }
   client.on("close", () => app.locals.clients.delete(client));
 });
 
@@ -499,6 +520,7 @@ app.get("/api/status", (_req, res) => res.json({
   error: lastError
 }));
 app.get("/api/positions", (_req, res) => res.json(publicPositions()));
+app.get("/api/market", (_req, res) => res.json(Array.from(marketTickers.values())));
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
