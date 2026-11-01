@@ -18,6 +18,11 @@ app.locals.clients = new Set();
 
 let listenKey = null;
 let userSocket = null;
+let marketSocket = null;
+let marketReconnectTimer = null;
+let marketGeneration = 0;
+let activeMarketSymbols = "";
+let marketState = "尚未連線";
 let keepAliveTimer = null;
 let reconnectTimer = null;
 let snapshotRetryTimer = null;
@@ -33,7 +38,7 @@ function overallState() {
   if (restState === "讀取失敗") return "REST 讀取失敗｜串流" + streamState;
   if (restState === "讀取中") return "REST 讀取中｜串流" + streamState;
   if (restState === "已讀取") return "REST 已讀取｜串流" + streamState;
-  return "REST " + restState + "｜串流" + streamState;
+  return "REST " + restState + "｜帳戶串流" + streamState + "｜行情" + marketState;
 }
 
 function positionKey(symbol, side) {
@@ -56,6 +61,7 @@ function publishStatus() {
     state: overallState(),
     restState,
     streamState,
+    marketState,
     error: lastError
   });
 }
@@ -68,6 +74,88 @@ function publicPositions() {
 
 function publishPositions() {
   sendToBrowsers("positions", publicPositions());
+}
+
+function syncMarketStream() {
+  const symbols = [...new Set(publicPositions().map(p => p.symbol.toLowerCase()))].sort();
+  const next = symbols.join(",");
+  if (next === activeMarketSymbols && marketSocket && marketSocket.readyState <= WebSocket.OPEN) return;
+  if (next === activeMarketSymbols && marketReconnectTimer) return;
+  activeMarketSymbols = next;
+  marketGeneration += 1;
+  const generation = marketGeneration;
+  if (marketReconnectTimer) {
+    clearTimeout(marketReconnectTimer);
+    marketReconnectTimer = null;
+  }
+  if (marketSocket) {
+    const old = marketSocket;
+    marketSocket = null;
+    old.removeAllListeners("close");
+    old.close();
+  }
+  if (!symbols.length) {
+    marketState = "等待持倉";
+    publishStatus();
+    return;
+  }
+  connectMarketStream(symbols, generation);
+}
+
+function connectMarketStream(symbols, generation) {
+  const streams = symbols.map(symbol => symbol + "@markPrice@1s").join("/");
+  const url = "wss://fstream.binance.com/stream?streams=" + streams;
+  marketState = "連線中";
+  publishStatus();
+  const socket = new WebSocket(url);
+  marketSocket = socket;
+  socket.on("open", () => {
+    if (generation !== marketGeneration) return;
+    marketState = "已連線";
+    console.log("Binance Mark Price Stream 已連線：" + symbols.join(", "));
+    publishStatus();
+  });
+  socket.on("message", raw => {
+    if (generation !== marketGeneration) return;
+    let message;
+    try { message = JSON.parse(raw.toString()); } catch { return; }
+    const event = message.data || message;
+    if (event.e !== "markPriceUpdate" || !event.s || event.p === undefined) return;
+    const mark = Number(event.p);
+    if (!Number.isFinite(mark)) return;
+    let changed = false;
+    for (const [key, position] of positions) {
+      if (position.symbol !== event.s) continue;
+      const amount = Number(position.positionAmt || 0);
+      const entry = Number(position.entryPrice || 0);
+      position.markPrice = String(mark);
+      position.unrealizedProfit = String((mark - entry) * amount);
+      position.markPriceEventTime = event.E || Date.now();
+      positions.set(key, position);
+      changed = true;
+    }
+    if (changed) {
+      lastEventAt = event.E || Date.now();
+      publishPositions();
+    }
+  });
+  socket.on("error", err => {
+    if (generation !== marketGeneration) return;
+    marketState = "連線錯誤";
+    lastError = "Mark Price Stream：" + err.message;
+    publishStatus();
+  });
+  socket.on("close", () => {
+    if (generation !== marketGeneration || isStopping) return;
+    marketSocket = null;
+    marketState = "已斷線，重新連線中";
+    publishStatus();
+    if (marketReconnectTimer) clearTimeout(marketReconnectTimer);
+    marketReconnectTimer = setTimeout(() => {
+      marketReconnectTimer = null;
+      if (generation === marketGeneration) connectMarketStream(symbols, generation);
+    }, 3000);
+  });
 }
 
 function createSignedQuery(params = {}) {
@@ -171,6 +259,7 @@ function applyAccountUpdate(event) {
   }
   lastEventAt = Date.now();
   publishPositions();
+  syncMarketStream();
 }
 
 async function loadInitialSnapshot() {
@@ -188,6 +277,7 @@ async function loadInitialSnapshot() {
   restState = "已讀取";
   lastError = null;
   publishPositions();
+  syncMarketStream();
   publishStatus();
   console.log("已取得初始持倉快照：" + positions.size + " 筆非零持倉");
 }
@@ -371,7 +461,7 @@ browserWss.on("connection", client => {
   app.locals.clients.add(client);
   client.send(JSON.stringify({
     type: "status",
-    payload: { state: overallState(), restState, streamState, error: lastError },
+    payload: { state: overallState(), restState, streamState, marketState, error: lastError },
     serverTime: Date.now()
   }));
   client.send(JSON.stringify({ type: "positions", payload: publicPositions(), serverTime: Date.now() }));
@@ -382,6 +472,7 @@ app.get("/api/status", (_req, res) => res.json({
   state: overallState(),
   restState,
   streamState,
+  marketState,
   lastEventAt,
   positionCount: publicPositions().length,
   error: lastError
@@ -395,8 +486,10 @@ async function shutdown() {
   isStopping = true;
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (marketReconnectTimer) clearTimeout(marketReconnectTimer);
   if (snapshotRetryTimer) clearTimeout(snapshotRetryTimer);
   if (userSocket) userSocket.close();
+  if (marketSocket) marketSocket.close();
   try {
     if (listenKey && API_KEY) await apiKeyRequest("DELETE", "/fapi/v1/listenKey");
   } catch (err) {
