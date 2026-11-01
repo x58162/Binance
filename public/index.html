@@ -27,6 +27,14 @@ th:first-child,td:first-child{text-align:left}tr:last-child td{border-bottom:0}.
 <div class="card"><div class="label">最後事件時間</div><div class="value" id="last">—</div></div>
 </div>
 <div class="notice" id="diagnostics" style="margin-bottom:16px">即時診斷：等待資料…</div>
+<h2>BTCUSDC 即時行情</h2>
+<div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
+<div class="card"><div class="label">最新成交價</div><div class="value" id="tickerLast">—</div></div>
+<div class="card"><div class="label">24 小時漲跌幅</div><div class="value" id="tickerChange">—</div></div>
+<div class="card"><div class="label">24 小時最高 / 最低</div><div class="value" id="tickerRange">—</div></div>
+<div class="card"><div class="label">24 小時成交量 (BTC)</div><div class="value" id="tickerVolume">—</div></div>
+<div class="card"><div class="label">標記價格（盈虧計算基準）</div><div class="value" id="tickerMark">—</div></div>
+</div>
 <h2>目前持倉</h2><div class="table-wrap"><table>
 <thead><tr><th>交易對</th><th>方向</th><th>持倉數量</th><th>開倉均價</th><th>標記價格</th><th>未實現盈虧</th><th>強平價格</th><th>槓桿</th><th>保證金模式</th><th>逐倉保證金</th></tr></thead>
 <tbody id="rows"><tr><td colspan="10" id="empty">等待 Binance 帳戶資料…</td></tr></tbody></table></div>
@@ -34,16 +42,18 @@ th:first-child,td:first-child{text-align:left}tr:last-child td{border-bottom:0}.
 </main>
 <script>
 const rows=document.getElementById("rows"),stateEl=document.getElementById("state"),countEl=document.getElementById("count"),lastEl=document.getElementById("last"),errorEl=document.getElementById("error"),diagnosticsEl=document.getElementById("diagnostics");
+const tickerLast=document.getElementById("tickerLast"),tickerChange=document.getElementById("tickerChange"),tickerRange=document.getElementById("tickerRange"),tickerVolume=document.getElementById("tickerVolume"),tickerMark=document.getElementById("tickerMark");
+function renderTicker(t){if(!t)return;tickerLast.textContent=n(t.lastPrice,2);tickerChange.textContent=n(t.priceChangePercent,2)+"%";tickerChange.className="value "+(Number(t.priceChangePercent)>=0?"positive":"negative");tickerRange.textContent=n(t.highPrice,2)+" / "+n(t.lowPrice,2);tickerVolume.textContent=n(t.volume,2);}
 let frontendPositionMessages=0,frontendLastPositionAt=null;
 function renderDiagnostics(p={}){const t=v=>v?new Date(v).toLocaleTimeString():"尚未收到";diagnosticsEl.textContent=`即時診斷｜行情事件：${p.markPriceEventCount??0}｜已計算持倉：${p.markPricePositionUpdateCount??0}｜伺服器推送：${p.browserPositionBroadcastCount??0}｜前端收到：${frontendPositionMessages}｜行情時間：${t(p.lastMarkPriceAt)}｜盈虧計算：${t(p.lastPnlCalculationAt)}｜前端收件：${t(frontendLastPositionAt)}｜瀏覽器連線：${p.browserClientCount??"—"}`;}
 function n(value,digits=8){const x=Number(value);if(!Number.isFinite(x))return value??"—";return x.toLocaleString("en-US",{maximumFractionDigits:digits});}
 function render(list){countEl.textContent=list.length;if(!list.length){rows.innerHTML='<tr><td colspan="10" id="empty">目前沒有非零持倉</td></tr>';return;}
-rows.innerHTML=list.map(p=>{const qty=Number(p.positionAmt||0),side=p.positionSide==="BOTH"?(qty>=0?"LONG":"SHORT"):p.positionSide,pnl=Number(p.unrealizedProfit||0);
+rows.innerHTML=list.map(p=>{const qty=Number(p.positionAmt||0),side=p.positionSide==="BOTH"?(qty>=0?"LONG":"SHORT"):p.positionSide,pnl=Number(p.unrealizedProfit||0);if(p.symbol==="BTCUSDC")tickerMark.textContent=n(p.markPrice,2);
 return `<tr><td>${p.symbol}</td><td><span class="side ${side==="LONG"?"long":"short"}">${side}</span></td><td>${n(p.positionAmt)}</td><td>${n(p.entryPrice)}</td><td>${n(p.markPrice)}</td><td class="${pnl>=0?"positive":"negative"}">${n(p.unrealizedProfit,6)}</td><td>${Number(p.liquidationPrice)===0?"—":n(p.liquidationPrice)}</td><td>${p.leverage?p.leverage+"x":"—"}</td><td>${p.marginType||"—"}</td><td>${n(p.isolatedWallet ?? "0", 6)}</td></tr>`;
 }).join("");}
 function connect(){const protocol=location.protocol==="https:"?"wss:":"ws:",socket=new WebSocket(`${protocol}//${location.host}/browser-ws`);
 socket.onmessage=ev=>{const msg=JSON.parse(ev.data);if(msg.type==="status"){stateEl.textContent=msg.payload.state;errorEl.textContent=msg.payload.error?"｜錯誤："+msg.payload.error:"";renderDiagnostics(msg.payload);}
-else if(msg.type==="positions"){frontendPositionMessages++;frontendLastPositionAt=msg.serverTime;render(msg.payload);lastEl.textContent=new Date(msg.serverTime).toLocaleTimeString();}else if(msg.type==="order"){lastEl.textContent=new Date(msg.serverTime).toLocaleTimeString();}};
+else if(msg.type==="positions"){frontendPositionMessages++;frontendLastPositionAt=msg.serverTime;render(msg.payload);lastEl.textContent=new Date(msg.serverTime).toLocaleTimeString();}else if(msg.type==="ticker"){renderTicker(msg.payload);}else if(msg.type==="order"){lastEl.textContent=new Date(msg.serverTime).toLocaleTimeString();}};
 socket.onclose=()=>setTimeout(connect,3000);}
 connect();fetch("/api/status").then(r=>r.json()).then(s=>{stateEl.textContent=s.state;if(s.error)errorEl.textContent="｜錯誤："+s.error;renderDiagnostics(s);});
 </script></body></html>
