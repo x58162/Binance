@@ -23,6 +23,11 @@ let marketReconnectTimer = null;
 let marketGeneration = 0;
 let activeMarketSymbols = "";
 let marketState = "尚未連線";
+let markPriceEventCount = 0;
+let markPricePositionUpdateCount = 0;
+let lastMarkPriceAt = null;
+let lastPnlCalculationAt = null;
+let browserPositionBroadcastCount = 0;
 let keepAliveTimer = null;
 let reconnectTimer = null;
 let snapshotRetryTimer = null;
@@ -35,9 +40,6 @@ let lastError = null;
 const positions = new Map();
 
 function overallState() {
-  if (restState === "讀取失敗") return "REST 讀取失敗｜串流" + streamState;
-  if (restState === "讀取中") return "REST 讀取中｜串流" + streamState;
-  if (restState === "已讀取") return "REST 已讀取｜串流" + streamState;
   return "REST " + restState + "｜帳戶串流" + streamState + "｜行情" + marketState;
 }
 
@@ -62,6 +64,12 @@ function publishStatus() {
     restState,
     streamState,
     marketState,
+    markPriceEventCount,
+    markPricePositionUpdateCount,
+    lastMarkPriceAt,
+    lastPnlCalculationAt,
+    browserPositionBroadcastCount,
+    browserClientCount: app.locals.clients.size,
     error: lastError
   });
 }
@@ -73,6 +81,7 @@ function publicPositions() {
 }
 
 function publishPositions() {
+  browserPositionBroadcastCount += 1;
   sendToBrowsers("positions", publicPositions());
 }
 
@@ -123,6 +132,8 @@ function connectMarketStream(symbols, generation) {
     if (event.e !== "markPriceUpdate" || !event.s || event.p === undefined) return;
     const mark = Number(event.p);
     if (!Number.isFinite(mark)) return;
+    markPriceEventCount += 1;
+    lastMarkPriceAt = event.E || Date.now();
     let changed = false;
     for (const [key, position] of positions) {
       if (position.symbol !== event.s) continue;
@@ -131,12 +142,16 @@ function connectMarketStream(symbols, generation) {
       position.markPrice = String(mark);
       position.unrealizedProfit = String((mark - entry) * amount);
       position.markPriceEventTime = event.E || Date.now();
+      position.pnlCalculatedAt = Date.now();
       positions.set(key, position);
+      markPricePositionUpdateCount += 1;
+      lastPnlCalculationAt = position.pnlCalculatedAt;
       changed = true;
     }
     if (changed) {
       lastEventAt = event.E || Date.now();
       publishPositions();
+      publishStatus();
     }
   });
   socket.on("error", err => {
@@ -461,7 +476,7 @@ browserWss.on("connection", client => {
   app.locals.clients.add(client);
   client.send(JSON.stringify({
     type: "status",
-    payload: { state: overallState(), restState, streamState, marketState, error: lastError },
+    payload: { state: overallState(), restState, streamState, marketState, markPriceEventCount, markPricePositionUpdateCount, lastMarkPriceAt, lastPnlCalculationAt, browserPositionBroadcastCount, browserClientCount: app.locals.clients.size, error: lastError },
     serverTime: Date.now()
   }));
   client.send(JSON.stringify({ type: "positions", payload: publicPositions(), serverTime: Date.now() }));
@@ -473,6 +488,12 @@ app.get("/api/status", (_req, res) => res.json({
   restState,
   streamState,
   marketState,
+  markPriceEventCount,
+  markPricePositionUpdateCount,
+  lastMarkPriceAt,
+  lastPnlCalculationAt,
+  browserPositionBroadcastCount,
+  browserClientCount: app.locals.clients.size,
   lastEventAt,
   positionCount: publicPositions().length,
   error: lastError
