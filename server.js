@@ -24,6 +24,8 @@ let marketGeneration = 0;
 let activeMarketSymbols = "";
 let marketState = "尚未連線";
 let markPriceEventCount = 0;
+let tickerEventCount = 0;
+let lastTickerAt = null;
 let markPricePositionUpdateCount = 0;
 let lastMarkPriceAt = null;
 let lastPnlCalculationAt = null;
@@ -66,6 +68,8 @@ function publishStatus() {
     streamState,
     marketState,
     markPriceEventCount,
+    tickerEventCount,
+    lastTickerAt,
     markPricePositionUpdateCount,
     lastMarkPriceAt,
     lastPnlCalculationAt,
@@ -114,7 +118,7 @@ function syncMarketStream() {
 
 function connectMarketStream(symbols, generation) {
   const streams = symbols.flatMap(symbol => [symbol + "@markPrice@1s", symbol + "@ticker"]).join("/");
-  const url = "wss://fstream.binance.com/stream?streams=" + streams;
+  const url = "wss://fstream.binance.com/market/stream?streams=" + streams;
   marketState = "連線中";
   publishStatus();
   const socket = new WebSocket(url);
@@ -132,6 +136,8 @@ function connectMarketStream(symbols, generation) {
     const event = message.data || message;
     if (!event.s) return;
     if (event.e === "24hrTicker") {
+      tickerEventCount += 1;
+      lastTickerAt = event.E || Date.now();
       const ticker = {
         symbol: event.s,
         lastPrice: String(event.c ?? "0"),
@@ -494,7 +500,7 @@ browserWss.on("connection", client => {
   app.locals.clients.add(client);
   client.send(JSON.stringify({
     type: "status",
-    payload: { state: overallState(), restState, streamState, marketState, markPriceEventCount, markPricePositionUpdateCount, lastMarkPriceAt, lastPnlCalculationAt, browserPositionBroadcastCount, browserClientCount: app.locals.clients.size, error: lastError },
+    payload: { state: overallState(), restState, streamState, marketState, markPriceEventCount, tickerEventCount, lastTickerAt, markPricePositionUpdateCount, lastMarkPriceAt, lastPnlCalculationAt, browserPositionBroadcastCount, browserClientCount: app.locals.clients.size, error: lastError },
     serverTime: Date.now()
   }));
   client.send(JSON.stringify({ type: "positions", payload: publicPositions(), serverTime: Date.now() }));
@@ -510,6 +516,8 @@ app.get("/api/status", (_req, res) => res.json({
   streamState,
   marketState,
   markPriceEventCount,
+  tickerEventCount,
+  lastTickerAt,
   markPricePositionUpdateCount,
   lastMarkPriceAt,
   lastPnlCalculationAt,
