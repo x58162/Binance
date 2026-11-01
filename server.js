@@ -7,11 +7,11 @@ const path = require("path");
 
 const app = express();
 const PORT = Number(process.env.PORT || 6092);
-const API_KEY = process.env.BINANCE_API_KEY || "";
-const API_SECRET = process.env.BINANCE_API_SECRET || "";
-const REST_BASE = (process.env.BINANCE_REST_BASE || "https://fapi.binance.com").replace(/\/$/, "");
-const WS_BASE = (process.env.BINANCE_WS_BASE || "wss://fstream.binance.com/private").replace(/\/$/, "");
-const BTCUSDC_ONLY = String(process.env.BTCUSDC_ONLY || "false").toLowerCase() === "true";
+const API_KEY = (process.env.BINANCE_API_KEY || "").trim();
+const API_SECRET = (process.env.BINANCE_API_SECRET || "").trim();
+const REST_BASE = (process.env.BINANCE_REST_BASE || "https://fapi.binance.com").trim().replace(/\/$/, "");
+const WS_BASE = (process.env.BINANCE_WS_BASE || "wss://fstream.binance.com/private").trim().replace(/\/$/, "");
+const BTCUSDC_ONLY = String(process.env.BTCUSDC_ONLY || "false").trim().toLowerCase() === "true";
 
 app.use(express.static(path.join(__dirname, "public")));
 app.locals.clients = new Set();
@@ -20,15 +20,24 @@ let listenKey = null;
 let userSocket = null;
 let keepAliveTimer = null;
 let reconnectTimer = null;
+let snapshotRetryTimer = null;
 let reconnectDelay = 3000;
 let isStopping = false;
 let lastEventAt = null;
-let connectionState = "啟動中";
+let restState = "尚未讀取";
+let streamState = "尚未連線";
 let lastError = null;
 const positions = new Map();
 
+function overallState() {
+  if (restState === "讀取失敗") return "REST 讀取失敗｜串流" + streamState;
+  if (restState === "讀取中") return "REST 讀取中｜串流" + streamState;
+  if (restState === "已讀取") return "REST 已讀取｜串流" + streamState;
+  return "REST " + restState + "｜串流" + streamState;
+}
+
 function positionKey(symbol, side) {
-  return `${symbol}:${side || "BOTH"}`;
+  return symbol + ":" + (side || "BOTH");
 }
 
 function isAllowedSymbol(symbol) {
@@ -42,8 +51,17 @@ function sendToBrowsers(type, payload) {
   }
 }
 
+function publishStatus() {
+  sendToBrowsers("status", {
+    state: overallState(),
+    restState,
+    streamState,
+    error: lastError
+  });
+}
+
 function publicPositions() {
-  return [...positions.values()]
+  return Array.from(positions.values())
     .filter(p => isAllowedSymbol(p.symbol))
     .sort((a, b) => a.symbol.localeCompare(b.symbol) || a.positionSide.localeCompare(b.positionSide));
 }
@@ -52,29 +70,58 @@ function publishPositions() {
   sendToBrowsers("positions", publicPositions());
 }
 
+function createSignedQuery(params = {}) {
+  if (!API_SECRET) throw new Error("尚未設定 BINANCE_API_SECRET");
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) query.append(key, String(value));
+  }
+  query.append("recvWindow", "10000");
+  query.append("timestamp", String(Date.now()));
+  const queryString = query.toString();
+  const signature = crypto.createHmac("sha256", API_SECRET).update(queryString, "utf8").digest("hex");
+  return { queryString, signature };
+}
+
 async function signedRequest(method, endpoint, params = {}) {
-  const query = new URLSearchParams({ ...params, timestamp: String(Date.now()), recvWindow: "10000" });
-  const signature = crypto.createHmac("sha256", API_SECRET).update(query.toString()).digest("hex");
-  const response = await fetch(`${REST_BASE}${endpoint}?${query.toString()}&signature=${signature}`, {
+  if (!API_KEY || !API_SECRET) throw new Error("尚未設定 Binance API Key / Secret");
+  const signed = createSignedQuery(params);
+  const url = REST_BASE + endpoint + "?" + signed.queryString + "&signature=" + signed.signature;
+  const response = await fetch(url, {
     method,
     headers: { "X-MBX-APIKEY": API_KEY }
   });
+
   const text = await response.text();
   let data;
-  try { data = JSON.parse(text); } catch { throw new Error(`Binance 回傳非 JSON：HTTP ${response.status}`); }
-  if (!response.ok) throw new Error(`Binance API ${data.code ?? response.status}: ${data.msg || response.statusText}`);
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("Binance 回傳非 JSON：HTTP " + response.status);
+  }
+
+  if (!response.ok) {
+    if (Number(data.code) === -1022) {
+      throw new Error("Binance API -1022：簽名不一致。請確認 API Key/Secret 是同一組、Secret 完整且沒有多餘字元；不要貼出 Secret。");
+    }
+    if (Number(data.code) === -1021) {
+      throw new Error("Binance API -1021：時間戳超出允許範圍，請確認主機時間同步。");
+    }
+    throw new Error("Binance API " + (data.code ?? response.status) + ": " + (data.msg || response.statusText));
+  }
   return data;
 }
 
 async function apiKeyRequest(method, endpoint) {
-  const response = await fetch(`${REST_BASE}${endpoint}`, {
+  if (!API_KEY) throw new Error("尚未設定 BINANCE_API_KEY");
+  const response = await fetch(REST_BASE + endpoint, {
     method,
     headers: { "X-MBX-APIKEY": API_KEY }
   });
   const text = await response.text();
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch {}
-  if (!response.ok) throw new Error(`listenKey API ${data.code ?? response.status}: ${data.msg || response.statusText}`);
+  if (!response.ok) throw new Error("listenKey API " + (data.code ?? response.status) + ": " + (data.msg || response.statusText));
   return data;
 }
 
@@ -127,14 +174,38 @@ function applyAccountUpdate(event) {
 }
 
 async function loadInitialSnapshot() {
+  restState = "讀取中";
+  publishStatus();
   const data = await signedRequest("GET", "/fapi/v3/positionRisk");
+  if (!Array.isArray(data)) throw new Error("Binance 持倉 API 回傳格式不符合預期");
+
   positions.clear();
   for (const raw of data) {
     const p = mapRestPosition(raw);
     if (Number(p.positionAmt) !== 0) positions.set(positionKey(p.symbol, p.positionSide), p);
   }
+
+  restState = "已讀取";
+  lastError = null;
   publishPositions();
-  console.log(`已取得初始持倉快照：${positions.size} 筆非零持倉`);
+  publishStatus();
+  console.log("已取得初始持倉快照：" + positions.size + " 筆非零持倉");
+}
+
+function scheduleSnapshotRetry() {
+  if (isStopping || snapshotRetryTimer) return;
+  snapshotRetryTimer = setTimeout(async () => {
+    snapshotRetryTimer = null;
+    try {
+      await loadInitialSnapshot();
+    } catch (err) {
+      restState = "讀取失敗";
+      lastError = err.message;
+      console.error("REST 持倉快照讀取失敗：", err.message);
+      publishStatus();
+      scheduleSnapshotRetry();
+    }
+  }, 30000);
 }
 
 async function createListenKey() {
@@ -156,14 +227,17 @@ async function keepAlive() {
 
 function scheduleReconnect() {
   if (isStopping || reconnectTimer) return;
-  connectionState = "重新連線中";
-  sendToBrowsers("status", { state: connectionState, error: lastError });
+  streamState = "重新連線中";
+  publishStatus();
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
-    try { await connectUserStream(); }
-    catch (err) {
+    try {
+      await connectUserStream();
+    } catch (err) {
       lastError = err.message;
+      streamState = "連線失敗";
       console.error("重新連線失敗：", err.message);
+      publishStatus();
       scheduleReconnect();
     }
   }, reconnectDelay);
@@ -172,13 +246,13 @@ function scheduleReconnect() {
 
 function connectSocket(key) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${WS_BASE}/ws/${key}`);
+    const socket = new WebSocket(WS_BASE + "/ws/" + key);
     userSocket = socket;
     let opened = false;
     const timeout = setTimeout(() => {
       if (!opened) {
         socket.terminate();
-        reject(new Error("WebSocket 連線逾時"));
+        reject(new Error("Binance User Data Stream WebSocket 連線逾時"));
       }
     }, 15000);
 
@@ -186,10 +260,9 @@ function connectSocket(key) {
       opened = true;
       clearTimeout(timeout);
       reconnectDelay = 3000;
-      connectionState = "已連線";
-      lastError = null;
+      streamState = "已連線";
       console.log("Binance User Data Stream 已連線");
-      sendToBrowsers("status", { state: connectionState, error: null });
+      publishStatus();
       resolve();
     });
 
@@ -202,9 +275,13 @@ function connectSocket(key) {
       } else if (event.e === "ORDER_TRADE_UPDATE") {
         lastEventAt = Date.now();
         sendToBrowsers("order", {
-          symbol: event.o?.s, side: event.o?.S, status: event.o?.X,
-          executionType: event.o?.x, quantity: event.o?.q,
-          averagePrice: event.o?.ap, eventTime: event.E
+          symbol: event.o?.s,
+          side: event.o?.S,
+          status: event.o?.X,
+          executionType: event.o?.x,
+          quantity: event.o?.q,
+          averagePrice: event.o?.ap,
+          eventTime: event.E
         });
       } else if (event.e === "listenKeyExpired") {
         console.warn("listenKey 已到期，準備重新建立");
@@ -226,8 +303,8 @@ function connectSocket(key) {
     socket.on("close", () => {
       if (userSocket === socket) userSocket = null;
       if (!isStopping) {
-        connectionState = "已斷線";
-        sendToBrowsers("status", { state: connectionState, error: lastError });
+        streamState = "已斷線";
+        publishStatus();
         scheduleReconnect();
       }
     });
@@ -235,14 +312,15 @@ function connectSocket(key) {
 }
 
 async function connectUserStream() {
-  connectionState = "取得 listenKey";
-  sendToBrowsers("status", { state: connectionState, error: null });
+  streamState = "取得 listenKey";
+  publishStatus();
   await createListenKey();
   await connectSocket(listenKey);
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   keepAliveTimer = setInterval(() => keepAlive().catch(err => {
     lastError = err.message;
     console.error(err.message);
+    publishStatus();
   }), 30 * 60 * 1000);
 }
 
@@ -258,20 +336,32 @@ async function restartUserStream() {
 }
 
 const httpServer = app.listen(PORT, async () => {
-  console.log(`本機持倉監控頁面：http://localhost:${PORT}`);
+  console.log("本機持倉監控頁面：http://localhost:" + PORT);
   if (!API_KEY || !API_SECRET) {
-    connectionState = "尚未設定 .env";
+    restState = "尚未設定 .env";
+    streamState = "未啟動";
     console.log("請複製 .env.example 為 .env，並填入 API Key / Secret。");
+    publishStatus();
     return;
   }
+
   try {
     await loadInitialSnapshot();
+  } catch (err) {
+    restState = "讀取失敗";
+    lastError = err.message;
+    console.error("啟動時 REST 持倉快照失敗：", err.message);
+    publishStatus();
+    scheduleSnapshotRetry();
+  }
+
+  try {
     await connectUserStream();
   } catch (err) {
     lastError = err.message;
-    connectionState = "連線失敗";
-    console.error("啟動失敗：", err.message);
-    sendToBrowsers("status", { state: connectionState, error: lastError });
+    streamState = "連線失敗";
+    console.error("User Data Stream 啟動失敗：", err.message);
+    publishStatus();
     scheduleReconnect();
   }
 });
@@ -279,13 +369,22 @@ const httpServer = app.listen(PORT, async () => {
 const browserWss = new WebSocket.Server({ server: httpServer, path: "/browser-ws" });
 browserWss.on("connection", client => {
   app.locals.clients.add(client);
-  client.send(JSON.stringify({ type: "status", payload: { state: connectionState, error: lastError }, serverTime: Date.now() }));
+  client.send(JSON.stringify({
+    type: "status",
+    payload: { state: overallState(), restState, streamState, error: lastError },
+    serverTime: Date.now()
+  }));
   client.send(JSON.stringify({ type: "positions", payload: publicPositions(), serverTime: Date.now() }));
   client.on("close", () => app.locals.clients.delete(client));
 });
 
 app.get("/api/status", (_req, res) => res.json({
-  state: connectionState, lastEventAt, positionCount: publicPositions().length, error: lastError
+  state: overallState(),
+  restState,
+  streamState,
+  lastEventAt,
+  positionCount: publicPositions().length,
+  error: lastError
 }));
 app.get("/api/positions", (_req, res) => res.json(publicPositions()));
 
@@ -296,6 +395,7 @@ async function shutdown() {
   isStopping = true;
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (snapshotRetryTimer) clearTimeout(snapshotRetryTimer);
   if (userSocket) userSocket.close();
   try {
     if (listenKey && API_KEY) await apiKeyRequest("DELETE", "/fapi/v1/listenKey");
