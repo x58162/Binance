@@ -253,7 +253,7 @@ function applyAccountUpdate(event) {
       breakEvenPrice: String(p.bep ?? old.breakEvenPrice ?? "0"),
       unrealizedProfit: String(p.up ?? old.unrealizedProfit ?? "0"),
       marginType: String(p.mt ?? old.marginType ?? ""),
-      isolatedMargin: String(p.iw ?? old.isolatedMargin ?? "0"),
+      isolatedWallet: String(p.iw ?? old.isolatedWallet ?? "0"),
       source: "WebSocket 更新"
     });
   }
